@@ -21,7 +21,7 @@ export interface BrowserResult {
   context: BrowserContext;
 }
 
-let browserResult: BrowserResult | undefined;
+const browserResults = new Map<string, Promise<BrowserResult>>();
 
 // Persistent user data directories.
 //
@@ -39,38 +39,54 @@ const DEFAULT_CLOAK_DATA_DIR = path.join(os.homedir(), '.cache', 'chrome-devtool
 export async function ensureBrowserConnected(options: {
   browserURL?: string;
 }): Promise<BrowserResult> {
-  if (browserResult) {
-    return browserResult;
+  const key = connectedBrowserCacheKey(options);
+  const existing = browserResults.get(key);
+  if (existing) {
+    return existing;
   }
 
   if (!options.browserURL) {
     throw new Error('browserURL must be provided');
   }
 
-  // Resolve the WebSocket debugger URL from the CDP HTTP endpoint.
-  const url = new URL('/json/version', options.browserURL);
-  const res = await fetch(url.toString());
-  const json = (await res.json()) as {webSocketDebuggerUrl: string};
-  const endpoint = json.webSocketDebuggerUrl;
+  const promise = (async () => {
+    // Resolve the WebSocket debugger URL from the CDP HTTP endpoint.
+    const url = new URL('/json/version', options.browserURL);
+    const res = await fetch(url.toString());
+    const json = (await res.json()) as {webSocketDebuggerUrl: string};
+    const endpoint = json.webSocketDebuggerUrl;
 
-  logger('Connecting Patchright via CDP to', endpoint);
-  const browser = await chromium.connectOverCDP(endpoint);
-  logger('Connected Patchright');
+    logger('Connecting Patchright via CDP to', endpoint);
+    const browser = await chromium.connectOverCDP(endpoint);
+    logger('Connected Patchright');
 
-  const context = browser.contexts()[0];
-  if (!context) {
-    throw new Error('No browser context found after connecting');
+    const context = browser.contexts()[0];
+    if (!context) {
+      throw new Error('No browser context found after connecting');
+    }
+
+    const result = {browser, context};
+
+    // Clear cached result when browser disconnects so we can reconnect.
+    browser.on('disconnected', () => {
+      logger('Browser disconnected, clearing cached browser result');
+      if (browserResults.get(key) === promise) {
+        browserResults.delete(key);
+      }
+    });
+
+    return result;
+  })();
+
+  browserResults.set(key, promise);
+  try {
+    return await promise;
+  } catch (error) {
+    if (browserResults.get(key) === promise) {
+      browserResults.delete(key);
+    }
+    throw error;
   }
-
-  browserResult = {browser, context};
-
-  // Clear cached result when browser disconnects so we can reconnect.
-  browser.on('disconnected', () => {
-    logger('Browser disconnected, clearing cached browser result');
-    browserResult = undefined;
-  });
-
-  return browserResult;
 }
 
 interface McpLaunchOptions {
@@ -175,25 +191,57 @@ export async function launch(options: McpLaunchOptions): Promise<BrowserResult> 
 export async function ensureBrowserLaunched(
   options: McpLaunchOptions,
 ): Promise<BrowserResult> {
-  if (browserResult) {
-    return browserResult;
-  }
-  browserResult = await launch(options);
-
-  // Clear cached result when browser is manually closed so we can relaunch.
-  const {browser, context} = browserResult;
-  if (browser) {
-    browser.on('disconnected', () => {
-      logger('Browser disconnected, clearing cached browser result');
-      browserResult = undefined;
-    });
-  } else {
-    // Persistent context mode (no browser object) — listen on context.
-    context.on('close', () => {
-      logger('Browser context closed, clearing cached browser result');
-      browserResult = undefined;
-    });
+  const key = launchedBrowserCacheKey(options);
+  const existing = browserResults.get(key);
+  if (existing) {
+    return existing;
   }
 
-  return browserResult;
+  const promise = (async () => {
+    const result = await launch(options);
+
+    // Clear cached result when browser is manually closed so we can relaunch.
+    const {browser, context} = result;
+    if (browser) {
+      browser.on('disconnected', () => {
+        logger('Browser disconnected, clearing cached browser result');
+        if (browserResults.get(key) === promise) {
+          browserResults.delete(key);
+        }
+      });
+    } else {
+      // Persistent context mode (no browser object) — listen on context.
+      context.on('close', () => {
+        logger('Browser context closed, clearing cached browser result');
+        if (browserResults.get(key) === promise) {
+          browserResults.delete(key);
+        }
+      });
+    }
+
+    return result;
+  })();
+
+  browserResults.set(key, promise);
+  try {
+    return await promise;
+  } catch (error) {
+    if (browserResults.get(key) === promise) {
+      browserResults.delete(key);
+    }
+    throw error;
+  }
+}
+
+function connectedBrowserCacheKey(options: {browserURL?: string}): string {
+  return `connect:${options.browserURL ?? ''}`;
+}
+
+function launchedBrowserCacheKey(options: McpLaunchOptions): string {
+  if (options.isolated) {
+    return `launch:isolated:${options.cloak ? 'cloak' : 'plain'}:${options.userDataDir ?? ''}`;
+  }
+  const userDataDir = path.resolve(options.userDataDir
+    ?? (options.cloak ? DEFAULT_CLOAK_DATA_DIR : DEFAULT_USER_DATA_DIR));
+  return `launch:persistent:${options.cloak ? 'cloak' : 'plain'}:${userDataDir}`;
 }
