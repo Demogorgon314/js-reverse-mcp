@@ -15,6 +15,7 @@ import type {
   BrowserContext,
 } from './third_party/index.js';
 import {chromium} from './third_party/index.js';
+import type {HumanConfig} from 'cloakbrowser/human';
 
 export interface BrowserResult {
   browser: Browser | undefined;
@@ -94,6 +95,8 @@ interface McpLaunchOptions {
   isolated: boolean;
   logFile?: fs.WriteStream;
   cloak?: boolean;
+  /** Enable CloakBrowser humanize for natural mouse/keyboard behavior */
+  humanize?: boolean;
 }
 
 export async function launch(options: McpLaunchOptions): Promise<BrowserResult> {
@@ -141,6 +144,27 @@ export async function launch(options: McpLaunchOptions): Promise<BrowserResult> 
     ignoreHTTPSErrors: true,
   };
 
+  // Helper to apply humanize patching after context creation
+  const applyHumanize = async (ctx: BrowserContext) => {
+    if (!options.humanize) return;
+    try {
+      const {patchContext} = await import('cloakbrowser/human');
+      const cfg: Partial<HumanConfig> = {
+        mouse_wobble_max: 3,
+        mouse_overshoot_chance: 0.15,
+        typing_delay: 40,
+        mistype_chance: 0.02,
+        idle_between_actions: true,
+        idle_between_duration: [200, 1200],
+      };
+      // Patchright's BrowserContext is API-compatible with Playwright's
+      patchContext(ctx as unknown as Parameters<typeof patchContext>[0], cfg as HumanConfig);
+      logger('Humanize patching applied to browser context');
+    } catch (err) {
+      logger('Failed to apply humanize patching:', (err as Error).message);
+    }
+  };
+
   // --isolated mode: launch() + newContext() for clean isolated context.
   // Creates an incognito-like context with no persisted state.
   if (isolated) {
@@ -158,6 +182,7 @@ export async function launch(options: McpLaunchOptions): Promise<BrowserResult> 
       await context.newPage();
     }
 
+    await applyHumanize(context);
     return {browser, context};
   }
 
@@ -176,6 +201,7 @@ export async function launch(options: McpLaunchOptions): Promise<BrowserResult> 
       ...contextOptions,
     });
 
+    await applyHumanize(context);
     return {browser: undefined, context};
   } catch (error) {
     if ((error as Error).message.includes('The browser is already running')) {
